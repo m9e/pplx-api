@@ -10,15 +10,15 @@ with open('requirements.txt', 'r', encoding='utf-8') as f:
     requirements = f.read().splitlines()
 
 setup(
-    name='pplx-api',
-    version='0.1.0',
+    name='pplx_api',
+    version='0.1.2',
     author='Kamiwaza AI',
     author_email='opensource@kamiwaza.ai',
     description='A Python client for the Perplexity AI API',
     long_description=long_description,
     long_description_content_type='text/markdown',
-    url='https://github.com/kamiwaza-ai/pplx-api',
-    packages=find_packages(exclude=['tests*']),
+    url='https://github.com/kamiwaza-ai/pplx_api',
+    packages=['pplx_api'],
     install_requires=requirements,
     classifiers=[
         'Development Status :: 3 - Alpha',
@@ -31,6 +31,5 @@ setup(
     ],
     python_requires='>=3.10',
     include_package_data=True,
-    package_data={'pplx-api': ['LICENSE']},
-    py_modules=['pplx-api'],
+    package_data={'pplx_api': ['LICENSE']},
 )
