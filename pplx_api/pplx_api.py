@@ -1,9 +1,11 @@
 import os
-from typing import List, Dict, Optional, Union, Any, Callable
+from typing import List, Dict, Optional, Union, Any, Callable, Awaitable
 import requests
 from pydantic import BaseModel, Field, field_validator
 from pydantic_core import PydanticCustomError
 import json
+import asyncio
+from functools import partial
 
 class Message(BaseModel):
     role: str
@@ -54,6 +56,12 @@ class PerplexityClient:
         self.api_key = api_key or os.environ.get("PERPLEXITY_API_KEY")
         if not self.api_key:
             raise ValueError("API key must be provided either as a parameter or through the PERPLEXITY_API_KEY environment variable.")
+        
+        # Create an event loop for async operations if needed
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
 
     def _get_headers(self) -> Dict[str, str]:
         """
@@ -66,12 +74,36 @@ class PerplexityClient:
             "Content-Type": "application/json"
         }
 
-    def chat_completion(self, request: PerplexityRequest, stream_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    def _wrap_callback(self, callback: Union[Callable[[str], None], Callable[[str], Awaitable[None]]], content: str):
+        """
+        Wrap callback to handle both sync and async callbacks safely.
+        """
+        if asyncio.iscoroutinefunction(callback):
+            # For async callbacks, create a task if we're in an event loop
+            if self._loop and self._loop.is_running():
+                self._loop.create_task(callback(content))
+            else:
+                # If no loop is running, run in a new loop
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(callback(content))
+                finally:
+                    loop.close()
+        else:
+            # For sync callbacks, just call directly
+            callback(content)
+
+    def chat_completion(
+        self, 
+        request: PerplexityRequest, 
+        stream_callback: Optional[Union[Callable[[str], None], Callable[[str], Awaitable[None]]]] = None
+    ) -> Dict[str, Any]:
         """
         Send a chat completion request to the Perplexity API.
 
         :param request: A PerplexityRequest object containing the request parameters.
-        :param stream_callback: Optional callback function to handle streaming responses.
+        :param stream_callback: Optional callback function (sync or async) to handle streaming responses.
         :return: The API response as a dictionary.
         :raises requests.RequestException: If there's an error making the request to the Perplexity API.
         """
@@ -96,12 +128,16 @@ class PerplexityClient:
             # Re-raise the exception with additional context
             raise requests.RequestException(f"Error making request to Perplexity API: {str(e)}") from e
 
-    def _handle_stream_response(self, response: requests.Response, stream_callback: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    def _handle_stream_response(
+        self, 
+        response: requests.Response, 
+        stream_callback: Optional[Union[Callable[[str], None], Callable[[str], Awaitable[None]]]] = None
+    ) -> Dict[str, Any]:
         """
         Handle streaming response from the Perplexity API.
 
         :param response: The streaming response object.
-        :param stream_callback: Optional callback function to handle streaming responses.
+        :param stream_callback: Optional callback function (sync or async) to handle streaming responses.
         :return: A dictionary containing the accumulated response data.
         """
         accumulated_response = {
@@ -146,8 +182,8 @@ class PerplexityClient:
                                 accumulated_response["usage"] = chunk["usage"]
                             
                             # Call the stream callback if provided
-                            if stream_callback:
-                                stream_callback(content)
+                            if stream_callback and content:
+                                self._wrap_callback(stream_callback, content)
                         except json.JSONDecodeError:
                             print(f"Failed to parse JSON from stream: {data}")
         
