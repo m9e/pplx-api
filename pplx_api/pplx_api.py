@@ -6,6 +6,7 @@ from pydantic_core import PydanticCustomError
 import json
 import asyncio
 from functools import partial
+import aiohttp
 
 class Message(BaseModel):
     role: str
@@ -56,12 +57,6 @@ class PerplexityClient:
         self.api_key = api_key or os.environ.get("PERPLEXITY_API_KEY")
         if not self.api_key:
             raise ValueError("API key must be provided either as a parameter or through the PERPLEXITY_API_KEY environment variable.")
-        
-        # Create an event loop for async operations if needed
-        try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._loop = None
 
     def _get_headers(self) -> Dict[str, str]:
         """
@@ -74,25 +69,22 @@ class PerplexityClient:
             "Content-Type": "application/json"
         }
 
-    def _wrap_callback(self, callback: Union[Callable[[str], None], Callable[[str], Awaitable[None]]], content: str):
+    def _handle_async_callback(self, callback: Callable[[str], Awaitable[None]], content: str) -> None:
         """
-        Wrap callback to handle both sync and async callbacks safely.
+        Safely handle async callbacks by creating a task in the current loop
         """
-        if asyncio.iscoroutinefunction(callback):
-            # For async callbacks, create a task if we're in an event loop
-            if self._loop and self._loop.is_running():
-                self._loop.create_task(callback(content))
-            else:
-                # If no loop is running, run in a new loop
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(callback(content))
-                finally:
-                    loop.close()
-        else:
-            # For sync callbacks, just call directly
-            callback(content)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(callback(content))
+        except RuntimeError:
+            # No event loop - this shouldn't happen in our use case
+            # but we'll handle it gracefully
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(callback(content))
+            finally:
+                loop.close()
 
     def chat_completion(
         self, 
@@ -163,6 +155,9 @@ class PerplexityClient:
                 "total_tokens": None
             }
         }
+
+        is_async_callback = stream_callback and asyncio.iscoroutinefunction(stream_callback)
+
         for line in response.iter_lines():
             if line:
                 event_data = line.decode('utf-8').strip()
@@ -183,7 +178,103 @@ class PerplexityClient:
                             
                             # Call the stream callback if provided
                             if stream_callback and content:
-                                self._wrap_callback(stream_callback, content)
+                                if is_async_callback:
+                                    self._handle_async_callback(stream_callback, content)
+                                else:
+                                    stream_callback(content)
+                        except json.JSONDecodeError:
+                            print(f"Failed to parse JSON from stream: {data}")
+        
+        return accumulated_response
+
+    async def async_chat_completion(
+        self, 
+        request: PerplexityRequest,
+        stream_callback: Optional[Callable[[str], Awaitable[None]]] = None
+    ) -> Dict[str, Any]:
+        """
+        Send an asynchronous chat completion request to the Perplexity API.
+
+        :param request: A PerplexityRequest object containing the request parameters.
+        :param stream_callback: Optional async callback function to handle streaming responses.
+        :return: The API response as a dictionary.
+        :raises aiohttp.ClientError: If there's an error making the request to the Perplexity API.
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.BASE_URL,
+                    json=request.model_dump(exclude_none=True),
+                    headers=self._get_headers(),
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as response:
+                    response.raise_for_status()
+                    
+                    if request.stream:
+                        return await self._handle_async_stream_response(response, stream_callback)
+                    else:
+                        return await response.json()
+                        
+        except aiohttp.ClientError as e:
+            raise aiohttp.ClientError(f"Error making request to Perplexity API: {str(e)}") from e
+
+    async def _handle_async_stream_response(
+        self,
+        response: aiohttp.ClientResponse,
+        stream_callback: Optional[Callable[[str], Awaitable[None]]] = None
+    ) -> Dict[str, Any]:
+        """
+        Handle async streaming response from the Perplexity API.
+
+        :param response: The streaming response object.
+        :param stream_callback: Optional async callback function to handle streaming responses.
+        :return: A dictionary containing the accumulated response data.
+        """
+        accumulated_response = {
+            "id": None,
+            "model": None,
+            "object": "chat.completion",
+            "created": None,
+            "choices": [{
+                "index": 0,
+                "finish_reason": None,
+                "message": {
+                    "role": "assistant",
+                    "content": ""
+                },
+                "delta": {
+                    "role": "assistant",
+                    "content": ""
+                }
+            }],
+            "usage": {
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None
+            }
+        }
+
+        async for line in response.content:
+            if line:
+                event_data = line.decode('utf-8').strip()
+                if event_data.startswith("data: "):
+                    data = event_data[6:]  # Remove "data: " prefix
+                    if data != "[DONE]":
+                        try:
+                            chunk = json.loads(data)
+                            # Update accumulated response with chunk data
+                            accumulated_response.update({k: v for k, v in chunk.items() if k not in ["choices", "usage"]})
+                            content = chunk["choices"][0]["delta"].get("content", "")
+                            accumulated_response["choices"][0]["delta"]["content"] += content
+                            accumulated_response["choices"][0]["message"]["content"] += content
+                            if "finish_reason" in chunk["choices"][0]:
+                                accumulated_response["choices"][0]["finish_reason"] = chunk["choices"][0]["finish_reason"]
+                            if "usage" in chunk:
+                                accumulated_response["usage"] = chunk["usage"]
+                            
+                            # Call the stream callback if provided
+                            if stream_callback and content:
+                                await stream_callback(content)
                         except json.JSONDecodeError:
                             print(f"Failed to parse JSON from stream: {data}")
         
@@ -197,13 +288,22 @@ def print_stream(content: str):
 
 # Example usage:
 if __name__ == "__main__":
-    client = PerplexityClient()
-    request = PerplexityRequest(
-        messages=[Message(role="user", content="What is Kamiwaza.AI?")]
-    )
-    print("Streaming response:")
-    response = client.chat_completion(request, stream_callback=print_stream)
-    print("\n\nFull response:")
-    print(json.dumps(response, indent=2))
-    print("\n\n")
-    print(response["choices"][0]["message"]["content"])
+    async def async_print_stream(content: str):
+        """
+        Async print the streaming response token by token.
+        """
+        print(content, end='', flush=True)
+
+    async def main():
+        client = PerplexityClient()
+        request = PerplexityRequest(
+            messages=[Message(role="user", content="What is Kamiwaza.AI?")]
+        )
+        print("Streaming response:")
+        response = await client.async_chat_completion(request, stream_callback=async_print_stream)
+        print("\n\nFull response:")
+        print(json.dumps(response, indent=2))
+        print("\n\n")
+        print(response["choices"][0]["message"]["content"])
+
+    asyncio.run(main())
