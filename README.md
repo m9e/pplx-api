@@ -5,6 +5,12 @@
 
 `pplx_api` is a Python client library for interacting with the Perplexity AI API. It provides a simple and intuitive interface to make chat completion requests to Perplexity's advanced language models.
 
+## Release Notes
+
+0.1.4: Updated for better ability to be used in multiple e2e streams at once
+
+0.1.3: Updated for perplexity model changes coming
+
 ## Installation
 
 You can install `pplx_api` using pip:
