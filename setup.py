@@ -11,7 +11,7 @@ with open('requirements.txt', 'r', encoding='utf-8') as f:
 
 setup(
     name='pplx_api',
-    version='0.1.3',
+    version='0.1.4',
     author='Kamiwaza AI',
     author_email='opensource@kamiwaza.ai',
     description='A Python client for the Perplexity AI API',
