@@ -8,6 +8,9 @@ import asyncio
 from functools import partial
 import aiohttp
 import backoff
+import logging
+
+logger = logging.getLogger(__name__)
 
 class Message(BaseModel):
     role: str
@@ -54,8 +57,9 @@ class PerplexityClient:
     INITIAL_WAIT = 1  # Initial wait in seconds
     MAX_WAIT = 4      # Max wait in seconds
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, debug: bool = False):
         self.api_key = api_key or os.environ.get("PERPLEXITY_API_KEY")
+        self.debug = debug
         if not self.api_key:
             raise ValueError("API key must be provided either as a parameter or through the PERPLEXITY_API_KEY environment variable.")
 
@@ -64,22 +68,6 @@ class PerplexityClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
-
-    async def _process_token(
-        self,
-        token: str,
-        stream_callback: Optional[Union[Callable[[str], None], Callable[[str], Awaitable[None]]]],
-        is_async_callback: bool
-    ) -> None:
-        """Process a single token from the stream."""
-        if stream_callback and token:
-            try:
-                if is_async_callback:
-                    await stream_callback(token)
-                else:
-                    stream_callback(token)
-            except Exception as e:
-                print(f"Error in stream callback: {e}")
 
     async def _stream_response(
         self,
@@ -113,9 +101,11 @@ class PerplexityClient:
             if data == "[DONE]":
                 return
 
+            if self.debug:
+                logger.debug(f"PPLX chunk: {data}")
+
             try:
                 chunk = json.loads(data)
-
                 # Update metadata
                 accumulated_response.update({
                     k: v for k, v in chunk.items() 
@@ -125,15 +115,24 @@ class PerplexityClient:
                 # Check for content delta
                 if "choices" in chunk and chunk["choices"]:
                     choice = chunk["choices"][0]
-                    if "delta" in choice and "content" in choice["delta"]:
-                        token = choice["delta"]["content"]
+                    delta = choice.get("delta", {})
+                    if "content" in delta:
+                        token = delta["content"]
                         
                         # Update accumulated content
                         accumulated_response["choices"][0]["delta"]["content"] += token
                         accumulated_response["choices"][0]["message"]["content"] += token
                         
                         # Immediately stream token
-                        await self._process_token(token, stream_callback, is_async_callback)
+                        if stream_callback:
+                            try:
+                                if is_async_callback:
+                                    await stream_callback(token)
+                                else:
+                                    stream_callback(token)
+                            except Exception as e:
+                                if self.debug:
+                                    logger.error(f"Error in stream callback: {e}")
 
                     # Handle completion
                     if "finish_reason" in choice:
@@ -144,7 +143,8 @@ class PerplexityClient:
                     accumulated_response["usage"] = chunk["usage"]
 
             except json.JSONDecodeError as e:
-                print(f"Failed to parse JSON from stream: {data} - {e}")
+                if self.debug:
+                    logger.error(f"Failed to parse JSON: {e}")
 
         if is_async:
             # Handle async response
@@ -164,7 +164,7 @@ class PerplexityClient:
         max_tries=MAX_RETRIES + 1,  # +1 because first try counts
         max_time=30,  # Maximum total time to try
         base=2,  # Use exponential backoff
-        logger=None  # Don't log each retry
+        logger=None  # Let app handle logging
     )
     async def _make_request(
         self,
@@ -206,8 +206,8 @@ class PerplexityClient:
                     return response.json()
 
         except (requests.exceptions.RequestException, aiohttp.ClientError) as e:
-            # Log the error and retry count
-            print(f"Request failed (attempt {attempt + 1}/{self.MAX_RETRIES + 1}): {str(e)}")
+            if self.debug:
+                logger.warning(f"Request attempt {attempt + 1}/{self.MAX_RETRIES + 1} failed: {str(e)}")
             raise
 
     def chat_completion(
